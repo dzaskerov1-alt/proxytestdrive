@@ -1,6 +1,7 @@
 import asyncio
 import time
 
+
 async def check_tcp(host, port, timeout=3):
     start = time.perf_counter()
     try:
