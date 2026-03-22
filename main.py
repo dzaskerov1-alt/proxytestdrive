@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 
-print("=== MAIN VERSION 3 LOADED ===")
+print("=== MAIN VERSION 4 ===")
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
