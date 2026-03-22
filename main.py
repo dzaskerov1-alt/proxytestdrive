@@ -2,6 +2,8 @@ import os
 import re
 import asyncio
 
+print("=== MAIN VERSION 3 LOADED ===")
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
