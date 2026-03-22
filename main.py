@@ -1,24 +1,17 @@
 import os
 import re
 import asyncio
-import logging
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 from checker import check_tcp
-from publisher import send_result
+from publisher import send_good_result, send_error_report
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID_RAW = os.getenv("ADMIN_ID")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-
-MAX_LATENCY_MS = int(os.getenv("MAX_LATENCY_MS", "1000"))
-MIN_SUCCESS_RATE = float(os.getenv("MIN_SUCCESS_RATE", "0.67"))
-CHECK_RETRIES = int(os.getenv("CHECK_RETRIES", "3"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
@@ -29,98 +22,122 @@ if not CHANNEL_ID:
 
 ADMIN_ID = int(ADMIN_ID_RAW)
 
+# Настройки проверки
+CHECK_RETRIES = 5
+CHECK_DELAY_SECONDS = 0.4
+MAX_AVG_LATENCY_MS = 800
+MIN_SUCCESS_RATE = 0.8
 
-def extract_fields(text: str):
-    server_match = re.search(r"Server\s*:\s*([^\n\r]+)", text, re.IGNORECASE)
+
+def parse_proxy_message(text: str):
+    server_match = re.search(r"Server\s*:\s*(\S+)", text, re.IGNORECASE)
     port_match = re.search(r"Port\s*:\s*(\d+)", text, re.IGNORECASE)
-    secret_match = re.search(r"Secret\s*:\s*([^\n\r]+)", text, re.IGNORECASE)
+    secret_match = re.search(r"Secret\s*:\s*(\S+)", text, re.IGNORECASE)
 
-    server = server_match.group(1).strip() if server_match else None
-    port = int(port_match.group(1)) if port_match else None
-    secret = secret_match.group(1).strip() if secret_match else ""
+    if not server_match or not port_match:
+        return None
 
-    return server, port, secret
+    return {
+        "server": server_match.group(1).strip(),
+        "port": int(port_match.group(1).strip()),
+        "secret": secret_match.group(1).strip() if secret_match else "",
+    }
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not update.message or not update.message.text:
-            return
+    if not update.message or not update.message.text:
+        return
 
-        if not update.effective_user or update.effective_user.id != ADMIN_ID:
-            return
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
 
-        text = update.message.text
-        logger.info("Получено сообщение от ADMIN_ID=%s: %s", ADMIN_ID, text)
+    parsed = parse_proxy_message(update.message.text)
 
-        server, port, secret = extract_fields(text)
-
-        if not server or not port:
-            await update.message.reply_text(
-                "❌ Неверный формат.\n\n"
-                "Отправь так:\n"
-                "🖥 Server: example.com\n"
-                "🔌 Port: 443\n"
-                "🔑 Secret: abc123"
-            )
-            return
-
+    if not parsed:
         await update.message.reply_text(
-            f"🔎 Начал проверку\n\n"
-            f"Server: {server}\n"
-            f"Port: {port}"
+            "❌ Неверный формат.\n\n"
+            "Отправь так:\n"
+            "Server: example.com\n"
+            "Port: 443\n"
+            "Secret: test"
+        )
+        return
+
+    server = parsed["server"]
+    port = parsed["port"]
+    secret = parsed["secret"]
+
+    await update.message.reply_text("⏳ Проверяю адрес, подожди...")
+
+    results = []
+    for _ in range(CHECK_RETRIES):
+        result = await check_tcp(server, port, timeout=3)
+        results.append(result)
+        await asyncio.sleep(CHECK_DELAY_SECONDS)
+
+    success_results = [r for r in results if r["ok"]]
+    success_rate = len(success_results) / len(results)
+
+    latencies = [r["latency"] for r in success_results if r["latency"] is not None]
+    avg_latency = int(sum(latencies) / len(latencies)) if latencies else None
+    best_latency = min(latencies) if latencies else None
+
+    fail_count = len(results) - len(success_results)
+
+    rejection_reason = None
+    if not success_results:
+        rejection_reason = "адрес не ответил ни на одну проверку"
+    elif success_rate < MIN_SUCCESS_RATE:
+        rejection_reason = (
+            f"недостаточная стабильность: success rate {int(success_rate * 100)}% "
+            f"при минимуме {int(MIN_SUCCESS_RATE * 100)}%"
+        )
+    elif avg_latency is None:
+        rejection_reason = "не удалось вычислить задержку"
+    elif avg_latency > MAX_AVG_LATENCY_MS:
+        rejection_reason = (
+            f"слишком высокая средняя задержка: {avg_latency} ms "
+            f"при максимуме {MAX_AVG_LATENCY_MS} ms"
         )
 
-        results = []
-        for _ in range(CHECK_RETRIES):
-            res = await check_tcp(server, port, timeout=3)
-            results.append(res)
-            await asyncio.sleep(0.3)
+    if rejection_reason:
+        await update.message.reply_text(
+            "❌ Адрес не прошёл проверку.\n\n"
+            f"Причина: {rejection_reason}\n"
+            f"Успешных проверок: {len(success_results)}/{len(results)}"
+        )
+        return
 
-        success = [r for r in results if r["ok"]]
-        success_rate = len(success) / len(results) if results else 0.0
-
-        latencies = [r["latency"] for r in success if r["latency"] is not None]
-        avg_latency = sum(latencies) / len(latencies) if latencies else None
-        best_latency = min(latencies) if latencies else None
-
-        if avg_latency is not None and avg_latency <= MAX_LATENCY_MS and success_rate >= MIN_SUCCESS_RATE:
-            await send_result(
-                bot=context.bot,
-                chat_id=CHANNEL_ID,
-                server=server,
-                port=port,
-                secret=secret,
-                avg=avg_latency,
-                rate=success_rate,
-                best=best_latency,
-            )
-            await update.message.reply_text(
-                "✅ Адрес прошёл проверку и отправлен в канал\n\n"
-                f"Средняя задержка: {int(avg_latency)} ms\n"
-                f"Успешность: {int(success_rate * 100)}%"
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Адрес не прошёл по качеству\n\n"
-                f"Средняя задержка: {int(avg_latency) if avg_latency is not None else 'нет данных'} ms\n"
-                f"Успешность: {int(success_rate * 100)}%\n\n"
-                f"Текущие пороги:\n"
-                f"- max latency: {MAX_LATENCY_MS} ms\n"
-                f"- min success: {int(MIN_SUCCESS_RATE * 100)}%"
-            )
-
+    try:
+        await send_good_result(
+            bot=context.bot,
+            chat_id=CHANNEL_ID,
+            server=server,
+            port=port,
+            secret=secret,
+            avg_latency=avg_latency,
+            best_latency=best_latency,
+            success_rate=success_rate,
+            checks_total=len(results),
+            checks_failed=fail_count,
+        )
+        await update.message.reply_text("✅ Адрес прошёл проверку и отправлен в канал")
     except Exception as e:
-        logger.exception("Ошибка в handle_message")
-        if update.message:
-            await update.message.reply_text(f"⚠️ Ошибка при обработке: {e}")
+        await update.message.reply_text(f"⚠️ Ошибка при отправке в канал: {e}")
+        await send_error_report(
+            bot=context.bot,
+            admin_chat_id=update.effective_chat.id,
+            error_text=str(e),
+            server=server,
+            port=port,
+        )
 
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot started")
-    app.run_polling(drop_pending_updates=True)
+    print("Bot started")
+    app.run_polling()
 
 
 if __name__ == "__main__":
